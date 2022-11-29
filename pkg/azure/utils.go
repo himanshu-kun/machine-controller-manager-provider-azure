@@ -33,7 +33,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/klog/v2"
 )
 
 // constant suffixes
@@ -380,50 +379,24 @@ func (d *MachinePlugin) createVMNicDisk(req *driver.CreateMachineRequest) (*comp
 
 			NICFuture, err := clients.GetNic().CreateOrUpdate(ctx, resourceGroupName, *NICParameters.Name, NICParameters)
 			if err != nil {
-				// Since machine creation failed, delete any infra resources created
-				deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-				if deleteErr != nil {
-					klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-				}
-
-				return nil, OnARMAPIErrorFail(prometheusServiceNIC, err, "NIC.CreateOrUpdate failed for %s", *NICParameters.Name)
+				return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "NIC.CreateOrUpdate", err, NICParameters.Name)
 			}
 
 			// Wait until NIC is created
 			err = NICFuture.WaitForCompletionRef(ctx, clients.GetClient())
 			if err != nil {
-				// Since machine creation failed, delete any infra resources created
-				deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-				if deleteErr != nil {
-					klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-				}
-
-				return nil, OnARMAPIErrorFail(prometheusServiceNIC, err, "NIC.WaitForCompletionRef failed for %s", *NICParameters.Name)
+				return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "NIC.WaitForCompletionRef", err, NICParameters.Name)
 			}
-			OnARMAPISuccess(prometheusServiceNIC, "NIC.CreateOrUpdate")
 
 			// Fetch NIC details
 			NIC, err = NICFuture.Result(clients.GetNicImpl())
 			if err != nil {
-				// Since machine creation failed, delete any infra resources created
-				deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-				if deleteErr != nil {
-					klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-				}
-
-				return nil, err
+				return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "NicFuture.Result", err, NICParameters.Name)
 			}
 			klog.V(3).Infof("NIC creation was successful for %q", nicName)
 		} else {
 			// Get on NIC returns a non 404 error. Exiting creation with the error.
-
-			// Since machine creation failed, delete any infra resources created
-			deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-			if deleteErr != nil {
-				klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-			}
-
-			return nil, OnARMAPIErrorFail(prometheusServiceNIC, err, "NIC.Get failed for %s", nicName)
+			return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "Nic.Get", err, &nicName)
 		}
 
 	} else {
@@ -447,13 +420,7 @@ func (d *MachinePlugin) createVMNicDisk(req *driver.CreateMachineRequest) (*comp
 			*imageReference.Version)
 
 		if err != nil {
-			//Since machine creation failed, delete any infra resources created
-			deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-			if deleteErr != nil {
-				klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-			}
-
-			return nil, OnARMAPIErrorFail(prometheusServiceVM, err, "VirtualMachineImagesclientutils.Get failed for %s", req.MachineClass.Name)
+			return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "VirtualMachineImagesclientutils.Get", err, &req.MachineClass.Name)
 		}
 
 		if vmImage.Plan != nil {
@@ -467,13 +434,7 @@ func (d *MachinePlugin) createVMNicDisk(req *driver.CreateMachineRequest) (*comp
 			)
 
 			if err != nil {
-				//Since machine creation failed, delete any infra resources created
-				deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-				if deleteErr != nil {
-					klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-				}
-
-				return nil, OnARMAPIErrorFail(prometheusServiceVM, err, "MarketplaceAgreementsclient.Get failed for %s", req.MachineClass.Name)
+				return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "MarketplaceAgreementsclientutils.Get", err, &req.MachineClass.Name)
 			}
 
 			if agreement.Accepted == nil || !*agreement.Accepted {
@@ -490,13 +451,7 @@ func (d *MachinePlugin) createVMNicDisk(req *driver.CreateMachineRequest) (*comp
 				)
 
 				if err != nil {
-					//Since machine creation failed, delete any infra resources created
-					deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-					if deleteErr != nil {
-						klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-					}
-
-					return nil, OnARMAPIErrorFail(prometheusServiceVM, err, "MarketplaceAgreementsclientutils.Create failed for %s", req.MachineClass.Name)
+					return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "MarketplaceAgreementsclientutils.Create", err, &req.MachineClass.Name)
 				}
 			}
 		}
@@ -510,42 +465,24 @@ func (d *MachinePlugin) createVMNicDisk(req *driver.CreateMachineRequest) (*comp
 	klog.V(3).Infof("VM creation began for %q", vmName)
 	VMFuture, err := clients.GetVM().CreateOrUpdate(ctx, resourceGroupName, *VMParameters.Name, VMParameters)
 	if err != nil {
-		//Since machine creation failed, delete any infra resources created
-		deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-		if deleteErr != nil {
-			klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-		}
-
-		return nil, OnARMAPIErrorFail(prometheusServiceVM, err, "GetVM().CreateOrUpdate failed for %s", *VMParameters.Name)
+		return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "GetVM().CreateOrUpdate", err, VMParameters.Name)
 	}
 	// Wait until VM is created
 	klog.V(3).Infof("Waiting for VM create call completion for %q", vmName)
 	err = VMFuture.WaitForCompletionRef(ctx, clients.GetClient())
 	if err != nil {
-		// Since machine creation failed, delete any infra resources created
-		deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-		if deleteErr != nil {
-			klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-		}
-
-		return nil, OnARMAPIErrorFail(prometheusServiceVM, err, "VMFuture.WaitForCompletionRef failed for %s", *VMParameters.Name)
+		return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "VMFuture.WaitForCompletionRef", err, VMParameters.Name)
 	}
 	klog.V(3).Infof("VM Created in %d", time.Since(startTime))
 
 	// Fetch VM details
 	VM, err := VMFuture.Result(clients.GetVMImpl())
 	if err != nil {
-		// Since machine creation failed, delete any infra resources created
-		deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
-		if deleteErr != nil {
-			klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
-		}
-
-		return nil, OnARMAPIErrorFail(prometheusServiceVM, err, "VMFuture.Result failed for %s", *VMParameters.Name)
+		return nil, d.cleanUpAnyCreatedVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames, "VMFuture.Result", err, VMParameters.Name)
 	}
 
 	OnARMAPISuccess(prometheusServiceVM, "VM.CreateOrUpdate")
-	klog.V(3).Infof("VM has been created succesfully for %q", vmName)
+	klog.V(3).Infof("VM has been created successfully for %q", vmName)
 
 	return &VM, nil
 }
@@ -593,6 +530,15 @@ func (d *MachinePlugin) deleteVMNicDisks(ctx context.Context, clients spi.AzureD
 	}
 
 	return RunInParallel(deleters)
+}
+
+func (d *MachinePlugin) cleanUpAnyCreatedVMNicDisks(ctx context.Context, clients spi.AzureDriverClientsInterface, resourceGroupName string, vmName string, nicName string, diskName string, dataDiskNames []string, errLogPrefix string, err error, nameInParameters *string) error {
+	deleteErr := d.deleteVMNicDisks(ctx, clients, resourceGroupName, vmName, nicName, diskName, dataDiskNames)
+	if deleteErr != nil {
+		klog.Errorf("Error occurred during resource clean up: %s", deleteErr)
+	}
+
+	return OnARMAPIErrorFail(prometheusServiceVM, err, "%s failed for %s", errLogPrefix, *nameInParameters)
 }
 
 func fillUpMachineClass(azureMachineClass *v1alpha1.AzureMachineClass, machineClass *v1alpha1.MachineClass) error {
